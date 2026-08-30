@@ -1,0 +1,12 @@
+# Never commit these - they are sensitive credentials
+credentials.json
+gmail_token.json
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# Local data that regenerates
+logs/scan_log.csv
+data/feedback.csv
