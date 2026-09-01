@@ -95,12 +95,23 @@ def handle_redirect_callback():
     If Google just redirected the visitor back with a `code`
     parameter, this exchanges it for credentials and stores them in
     THIS visitor's session only. Safe to call when there's no code
-    present - it just does nothing in that case."""
+    present - it just does nothing in that case.
+
+    Guards against Streamlit's automatic reruns submitting the same
+    one-time authorization code to Google more than once - Google
+    accepts a code exactly once and rejects any repeat with
+    invalid_grant, which otherwise surfaces as a crash on screen."""
     params = st.query_params
     code = params.get("code")
     returned_state = params.get("state")
     if not code:
         return False
+
+    if st.session_state.get("_gmail_last_code_seen") == code:
+        # Already handled (successfully or not) on an earlier rerun
+        # of this same script - don't resubmit it.
+        return is_connected()
+    st.session_state["_gmail_last_code_seen"] = code
 
     expected_state = st.session_state.get("_gmail_oauth_state")
     if expected_state and returned_state != expected_state:
@@ -108,11 +119,17 @@ def handle_redirect_callback():
         st.query_params.clear()
         return False
 
-    flow = Flow.from_client_config(
-        _client_config(), scopes=SCOPES,
-        redirect_uri=st.secrets["gmail"]["redirect_uri"],
-    )
-    flow.fetch_token(code=code)
+    try:
+        flow = Flow.from_client_config(
+            _client_config(), scopes=SCOPES,
+            redirect_uri=st.secrets["gmail"]["redirect_uri"],
+        )
+        flow.fetch_token(code=code)
+    except Exception as e:
+        st.query_params.clear()
+        st.error(f"Google login could not be completed ({e}). Please click Connect Gmail Account again.")
+        return False
+
     creds = flow.credentials
     st.session_state["gmail_creds"] = creds.to_json()
     st.query_params.clear()
