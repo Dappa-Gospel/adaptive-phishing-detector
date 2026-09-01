@@ -76,7 +76,14 @@ def get_authorization_url():
     """Builds the link the visitor clicks to start Google login. A
     random `state` value is stored in this visitor's session and
     later checked on return, as a CSRF protection - it proves the
-    person completing login is the same person who started it."""
+    person completing login is the same person who started it.
+
+    Also stores the PKCE `code_verifier` that google-auth-oauthlib
+    generates automatically for this flow. Google's token exchange
+    later requires this exact same verifier to prove the request
+    completing login is the same one that started it - so it must be
+    carried over to handle_redirect_callback() via session_state,
+    since that function builds a separate Flow object."""
     flow = Flow.from_client_config(
         _client_config(), scopes=SCOPES,
         redirect_uri=st.secrets["gmail"]["redirect_uri"],
@@ -87,6 +94,7 @@ def get_authorization_url():
         prompt="consent",
     )
     st.session_state["_gmail_oauth_state"] = state
+    st.session_state["_gmail_code_verifier"] = flow.code_verifier
     return auth_url
 
 
@@ -124,6 +132,7 @@ def handle_redirect_callback():
             _client_config(), scopes=SCOPES,
             redirect_uri=st.secrets["gmail"]["redirect_uri"],
         )
+        flow.code_verifier = st.session_state.get("_gmail_code_verifier")
         flow.fetch_token(code=code)
     except Exception as e:
         st.query_params.clear()
@@ -143,6 +152,7 @@ def is_connected():
 def disconnect():
     st.session_state.pop("gmail_creds", None)
     st.session_state.pop("_gmail_oauth_state", None)
+    st.session_state.pop("_gmail_code_verifier", None)
 
 
 def get_gmail_service():
