@@ -78,15 +78,20 @@ def get_authorization_url():
     later checked on return, as a CSRF protection - it proves the
     person completing login is the same person who started it.
 
-    Also stores the PKCE `code_verifier` that google-auth-oauthlib
-    generates automatically for this flow. Google's token exchange
-    later requires this exact same verifier to prove the request
-    completing login is the same one that started it - so it must be
-    carried over to handle_redirect_callback() via session_state,
-    since that function builds a separate Flow object."""
+    PKCE (autogenerate_code_verifier) is deliberately disabled here.
+    PKCE exists to protect "public" clients that can't safely hold a
+    secret (like mobile apps). This app authenticates with Google
+    using a client_secret instead (a "confidential" client), which
+    already proves its identity without needing PKCE. Using PKCE here
+    would require the code_verifier generated for the login link to
+    still be available later when Google redirects back - but that
+    redirect is a real browser navigation, not just an in-app rerun,
+    and isn't guaranteed to land back in the exact same Streamlit
+    session. Skipping PKCE entirely avoids depending on that."""
     flow = Flow.from_client_config(
         _client_config(), scopes=SCOPES,
         redirect_uri=st.secrets["gmail"]["redirect_uri"],
+        autogenerate_code_verifier=False,
     )
     auth_url, state = flow.authorization_url(
         access_type="offline",
@@ -94,7 +99,6 @@ def get_authorization_url():
         prompt="consent",
     )
     st.session_state["_gmail_oauth_state"] = state
-    st.session_state["_gmail_code_verifier"] = flow.code_verifier
     return auth_url
 
 
@@ -131,8 +135,8 @@ def handle_redirect_callback():
         flow = Flow.from_client_config(
             _client_config(), scopes=SCOPES,
             redirect_uri=st.secrets["gmail"]["redirect_uri"],
+            autogenerate_code_verifier=False,
         )
-        flow.code_verifier = st.session_state.get("_gmail_code_verifier")
         flow.fetch_token(code=code)
     except Exception as e:
         st.query_params.clear()
@@ -152,7 +156,6 @@ def is_connected():
 def disconnect():
     st.session_state.pop("gmail_creds", None)
     st.session_state.pop("_gmail_oauth_state", None)
-    st.session_state.pop("_gmail_code_verifier", None)
 
 
 def get_gmail_service():
