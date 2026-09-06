@@ -34,9 +34,12 @@ def _load():
     return _model, _vectorizer
 
 
-def analyze_reasons(text):
-    """Rule-based explanation layer - does not affect the verdict,
-    only helps explain why a PHISHING message was flagged."""
+def analyze_reasons(text, include_fallback=True):
+    """Rule-based explanation layer - does not affect the verdict on
+    its own, but see classify() for how it now gates the ML score.
+    Set include_fallback=False to get only genuine rule hits, with no
+    filler text when nothing matched - used by classify() to detect
+    whether a message has ANY real red flag at all."""
     reasons = []
     text_lower = text.lower()
 
@@ -62,29 +65,52 @@ def analyze_reasons(text):
     if re.search(r"-[a-z]+\.(com|net|org)", text_lower):
         reasons.append("Domain contains a suspicious hyphenated pattern")
 
-    if not reasons:
+    if not reasons and include_fallback:
         reasons.append("Message pattern matches known phishing language")
 
     return reasons
 
 
 def classify(text):
-    """Hybrid decision: ML probability combined with a rule-based
-    safety net. See generate_dataset.py / train_model.py notes for
-    why short credential-harvesting messages need this."""
+    """Hybrid decision combining the ML model with two rule-based
+    gates, in opposite directions:
+
+    1. LOWER the bar for messages that directly request credentials
+       (password, PIN, card number, etc.) - these are almost never
+       legitimate to send over chat/email, so the ML doesn't need to
+       be independently confident.
+
+    2. RAISE the bar for messages with ZERO real red flags at all.
+       Short, generic messages (e.g. "how are you doing") often share
+       almost no vocabulary with the training data, so the ML's
+       probability for them sits close to a random 50/50 guess rather
+       than reflecting genuine evidence. Without this gate, that near
+       coin-flip score alone could tip an entirely ordinary message
+       into a false PHISHING verdict. Requiring either a real rule
+       hit OR high ML confidence (>=80%) before convicting protects
+       against exactly that failure mode, while still allowing a
+       well-written phishing attempt to be caught if the ML is
+       genuinely confident about it."""
     model, vectorizer = _load()
     vec = vectorizer.transform([text])
     proba = model.predict_proba(vec)[0]     # [P(safe), P(phishing)]
     phishing_prob = proba[1]
 
-    reasons = analyze_reasons(text)
+    rule_hits = analyze_reasons(text, include_fallback=False)
     has_credential_request = any(k in text.lower() for k in CREDENTIAL_KEYWORDS)
 
-    threshold = 0.30 if has_credential_request else 0.50
+    if has_credential_request:
+        threshold = 0.30
+    elif rule_hits:
+        threshold = 0.50
+    else:
+        # No concrete red flags at all - only convict on strong ML confidence.
+        threshold = 0.80
+
     is_phishing = phishing_prob >= threshold
 
     verdict = "PHISHING" if is_phishing else "SAFE"
     shown_confidence = phishing_prob if is_phishing else (1 - phishing_prob)
     confidence = round(shown_confidence * 100, 1)
-    reasons = reasons if is_phishing else []
+    reasons = analyze_reasons(text) if is_phishing else []
     return verdict, confidence, reasons
