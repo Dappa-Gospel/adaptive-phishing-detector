@@ -42,6 +42,7 @@ Security practices this module follows:
 
 import os
 import stat
+from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -52,12 +53,14 @@ from googleapiclient.discovery import build
 # messages (see module docstring point 2). It does NOT grant send or
 # permanent-delete capability.
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-TOKEN_PATH = "gmail_token.json"
-CREDENTIALS_PATH = "credentials.json"
+
+BASE_DIR = Path(__file__).resolve().parent
+TOKEN_PATH = BASE_DIR / "gmail_token.json"
+CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 
 
 def is_connected():
-    return os.path.exists(TOKEN_PATH)
+    return TOKEN_PATH.exists()
 
 
 def _lock_down_token_file():
@@ -73,14 +76,14 @@ def connect():
     """Runs the OAuth consent flow. Opens the user's browser to
     Google's own login/consent page - this app never sees their
     Gmail password. Returns the connected email address."""
-    if not os.path.exists(CREDENTIALS_PATH):
+    if not CREDENTIALS_PATH.exists():
         raise FileNotFoundError(
             "credentials.json not found. Follow SETUP_GUIDE.md to create "
             "your own Google Cloud OAuth credentials first."
         )
-    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
     creds = flow.run_local_server(port=0)
-    with open(TOKEN_PATH, "w") as f:
+    with TOKEN_PATH.open("w", encoding="utf-8") as f:
         f.write(creds.to_json())
     _lock_down_token_file()
     return get_connected_email(build("gmail", "v1", credentials=creds))
@@ -90,8 +93,8 @@ def disconnect():
     """Deletes the local token. The user's Google account itself is
     untouched - they can also revoke access independently at
     https://myaccount.google.com/permissions."""
-    if os.path.exists(TOKEN_PATH):
-        os.remove(TOKEN_PATH)
+    if TOKEN_PATH.exists():
+        TOKEN_PATH.unlink()
 
 
 def get_gmail_service():
@@ -100,11 +103,11 @@ def get_gmail_service():
     if not is_connected():
         raise RuntimeError("Gmail is not connected. Call connect() first.")
 
-    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(TOKEN_PATH, "w") as f:
+            with TOKEN_PATH.open("w", encoding="utf-8") as f:
                 f.write(creds.to_json())
             _lock_down_token_file()
         else:

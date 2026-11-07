@@ -17,104 +17,182 @@ Why Naive Bayes instead of Random Forest:
   which is exactly what this project already uses.
 - Output is strictly binary: PHISHING or SAFE. No confidence-based
   "suspicious" middle tier — simpler to reason about and defend.
+
+Adaptive learning:
+- User corrections from data/feedback.csv are merged into the
+  training data before the split. Corrections replace any conflicting
+  dataset row for the same message, and are repeated FEEDBACK_WEIGHT
+  times so a handful of corrections are not drowned out by the
+  synthetic data.
+
+Evaluation honesty:
+- Near-duplicate messages (same text apart from punctuation/case) are
+  collapsed before the train/test split. The old pipeline put
+  punctuation-only variants of the same sentence in both sets, which
+  inflated the reported accuracy.
 """
 
+from __future__ import annotations
+
 import json
-import pandas as pd
+import re
+from pathlib import Path
+
 import joblib
-
-from sklearn.model_selection import train_test_split, cross_val_score
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
 )
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.naive_bayes import MultinomialNB
 
-DATA_PATH = "data/dataset.csv"
+from classifier import decide
+import storage
 
-# Direct credential-harvesting keywords. A message that explicitly asks
-# for a password, PIN, card number, etc. is almost never legitimate to
-# send over chat/email, so the hybrid decision (mirrored in app.py)
-# lowers the ML probability threshold needed to flag these as
-# phishing, rather than requiring the bag-of-words model to be
-# independently confident from word frequency alone - which is
-# unreliable on short messages.
-CREDENTIAL_KEYWORDS = ["password", "pin", "cvv", "otp", "one-time password",
-                        "card number", "account number", "routing number",
-                        "social security", "login and password", "ssn"]
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data" / "dataset.csv"
+MODEL_PATH = BASE_DIR / "models" / "phishing_model.pkl"
+VECTORIZER_PATH = BASE_DIR / "models" / "vectorizer.pkl"
+METRICS_PATH = BASE_DIR / "models" / "metrics.json"
 
-def hybrid_predict(texts, phishing_probs):
-    """Apply the same rule-assisted threshold used in app.py so the
-    metrics reported here match what the deployed app actually does."""
-    preds = []
-    for text, p in zip(texts, phishing_probs):
-        has_cred = any(k in text.lower() for k in CREDENTIAL_KEYWORDS)
-        threshold = 0.30 if has_cred else 0.50
-        preds.append(1 if p >= threshold else 0)
-    return preds
+FEEDBACK_WEIGHT = 3  # how many times a user correction is repeated
 
-# Step 1: Load the dataset
-df = pd.read_csv(DATA_PATH)
-print(f"Loaded {len(df)} samples")
 
-# Step 2: Convert text to numbers with TF-IDF
-vectorizer = TfidfVectorizer(
-    ngram_range=(1, 2),
-    max_features=3000,
-    sublinear_tf=True,
-)
-X = vectorizer.fit_transform(df["text"])
-y = df["label"]
+def normalize_text(text: str) -> str:
+    """Case/punctuation-insensitive key used only for de-duplication."""
+    return re.sub(r"[^a-z0-9 ]", "", str(text).lower()).strip()
 
-# Step 3: Split into training (80%) and testing (20%) sets
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
 
-# Step 4: Train the Naive Bayes model
-model = MultinomialNB(alpha=1.0)
-model.fit(X_train, y_train)
+def load_training_frame() -> tuple[pd.DataFrame, int, int]:
+    """Load dataset + feedback, let feedback win, and collapse
+    near-duplicates. Returns (frame, feedback_count, removed_count)."""
+    df = pd.read_csv(DATA_PATH)
+    df["text"] = df["text"].astype(str).str.strip()
+    df = df[df["text"] != ""]
+    original_count = len(df)
 
-# Step 5: Evaluate on the held-out test set using the same hybrid
-# rule-assisted decision the app uses (not just the raw model)
-test_texts = df.loc[y_test.index, "text"].tolist()
-test_probs = model.predict_proba(X_test)[:, 1]
-y_pred = hybrid_predict(test_texts, test_probs)
+    feedback_rows = storage.read_feedback()
+    if feedback_rows:
+        fb = pd.DataFrame(feedback_rows)
+        fb["text"] = fb["text"].astype(str).str.strip()
+        fb = fb[fb["text"] != ""]
+        # User corrections override the synthetic label for the same text.
+        fb_keys = set(fb["text"].map(normalize_text))
+        df = df[~df["text"].map(normalize_text).isin(fb_keys)]
+        # Repeat corrections so they carry real weight in training.
+        fb = pd.concat([fb] * FEEDBACK_WEIGHT, ignore_index=True)
+        df = pd.concat([df, fb], ignore_index=True)
 
-acc = accuracy_score(y_test, y_pred)
-prec = precision_score(y_test, y_pred)
-rec = recall_score(y_test, y_pred)
-f1 = f1_score(y_test, y_pred)
-cm = confusion_matrix(y_test, y_pred)
+    # Collapse punctuation/case variants that would otherwise leak
+    # across the train/test boundary.
+    df["_key"] = df["text"].map(normalize_text)
+    df = df[~df["_key"].duplicated(keep="first")].drop(columns="_key")
+    df = df.reset_index(drop=True)
 
-# Step 6: 5-fold cross-validation for a more reliable estimate
-cv_scores = cross_val_score(model, X, y, cv=5, scoring="accuracy")
+    removed = original_count + (len(feedback_rows) * FEEDBACK_WEIGHT) - len(df)
+    return df, len(feedback_rows), max(removed, 0)
 
-metrics = {
-    "algorithm": "Multinomial Naive Bayes + rule-assisted threshold (hybrid)",
-    "accuracy": round(acc, 4),
-    "precision": round(prec, 4),
-    "recall": round(rec, 4),
-    "f1_score": round(f1, 4),
-    "cv_mean": round(cv_scores.mean(), 4),
-    "cv_std": round(cv_scores.std(), 4),
-    "confusion_matrix": {
-        "true_negative": int(cm[0][0]),
-        "false_positive": int(cm[0][1]),
-        "false_negative": int(cm[1][0]),
-        "true_positive": int(cm[1][1]),
-    },
-    "train_size": X_train.shape[0],
-    "test_size": X_test.shape[0],
-    "total_samples": len(df),
-}
 
-print(json.dumps(metrics, indent=2))
+def build_model(X_train, y_train):
+    model = MultinomialNB(alpha=1.0)
+    model.fit(X_train, y_train)
+    return model
 
-# Step 7: Save the model, vectorizer, and metrics
-joblib.dump(model, "models/phishing_model.pkl")
-joblib.dump(vectorizer, "models/vectorizer.pkl")
-with open("models/metrics.json", "w") as f:
-    json.dump(metrics, f, indent=2)
 
-print("\nSaved model, vectorizer, and metrics to models/")
+def hybrid_predictions(texts, phishing_probs):
+    return [1 if decide(p, text)[0] else 0 for text, p in zip(texts, phishing_probs)]
+
+
+def main() -> None:
+    df, feedback_count, removed = load_training_frame()
+    print(f"Loaded {len(df)} samples "
+          f"({(df['label'] == 1).sum()} phishing, {(df['label'] == 0).sum()} legitimate)")
+    print(f"Feedback rows merged: {feedback_count} (weight x{FEEDBACK_WEIGHT})")
+    print(f"Near-duplicates removed before split: {removed}")
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        max_features=3000,
+        sublinear_tf=True,
+    )
+    X = vectorizer.fit_transform(df["text"])
+    y = df["label"].to_numpy()
+    texts = df["text"].tolist()
+
+    X_train, X_test, y_train, y_test, text_train, text_test = train_test_split(
+        X, y, texts,
+        test_size=0.2, random_state=42, stratify=y,
+    )
+
+    model = build_model(X_train, y_train)
+
+    # Evaluate with the same hybrid rule the app uses.
+    test_probs = model.predict_proba(X_test)[:, 1]
+    y_pred = hybrid_predictions(text_test, test_probs)
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    # Cross-validation of the full hybrid pipeline, not just the raw
+    # model, so cv_mean describes the deployed behaviour.
+    cv_scores = []
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for train_idx, test_idx in skf.split(X, y):
+        fold_model = build_model(X[train_idx], y[train_idx])
+        fold_probs = fold_model.predict_proba(X[test_idx])[:, 1]
+        fold_texts = [texts[i] for i in test_idx]
+        fold_pred = hybrid_predictions(fold_texts, fold_probs)
+        cv_scores.append(accuracy_score(y[test_idx], fold_pred))
+    cv_scores = pd.Series(cv_scores)
+
+    safe_total = tn + fp
+    phish_total = tp + fn
+    per_class_accuracy = {
+        "safe": round(tn / safe_total, 4) if safe_total else 0.0,
+        "phishing": round(tp / phish_total, 4) if phish_total else 0.0,
+    }
+
+    metrics = {
+        "algorithm": "Multinomial Naive Bayes + rule-assisted threshold (hybrid)",
+        "accuracy": round(acc, 4),
+        "precision": round(prec, 4),
+        "recall": round(rec, 4),
+        "f1_score": round(f1, 4),
+        "cv_mean": round(float(cv_scores.mean()), 4),
+        "cv_std": round(float(cv_scores.std()), 4),
+        "confusion_matrix": {
+            "true_negative": int(tn),
+            "false_positive": int(fp),
+            "false_negative": int(fn),
+            "true_positive": int(tp),
+        },
+        "per_class_accuracy": per_class_accuracy,
+        "train_size": int(X_train.shape[0]),
+        "test_size": int(X_test.shape[0]),
+        "total_samples": int(len(df)),
+        "feedback_samples": int(feedback_count),
+        "duplicates_removed": int(removed),
+    }
+
+    print(json.dumps(metrics, indent=2))
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(vectorizer, VECTORIZER_PATH)
+    with METRICS_PATH.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("\nSaved model, vectorizer and metrics to models/")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,24 @@
 {
   "algorithm": "Multinomial Naive Bayes + rule-assisted threshold (hybrid)",
-  "accuracy": 0.9818,
-  "precision": 0.9878,
-  "recall": 0.9759,
-  "f1_score": 0.9818,
-  "cv_mean": 0.9696,
-  "cv_std": 0.0128,
+  "accuracy": 0.9747,
+  "precision": 0.987,
+  "recall": 0.962,
+  "f1_score": 0.9744,
+  "cv_mean": 0.9759,
+  "cv_std": 0.0144,
   "confusion_matrix": {
-    "true_negative": 81,
+    "true_negative": 78,
     "false_positive": 1,
-    "false_negative": 2,
-    "true_positive": 81
+    "false_negative": 3,
+    "true_positive": 76
   },
-  "train_size": 658,
-  "test_size": 165,
-  "total_samples": 823
+  "per_class_accuracy": {
+    "safe": 0.9873,
+    "phishing": 0.962
+  },
+  "train_size": 631,
+  "test_size": 158,
+  "total_samples": 789,
+  "feedback_samples": 0,
+  "duplicates_removed": 34
 }

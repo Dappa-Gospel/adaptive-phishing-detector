@@ -6,7 +6,15 @@ gmail_token.json
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.pytest_cache/
+.env
 
 # Local data that regenerates
 logs/scan_log.csv
 data/feedback.csv
+
+# Archives / OS noise
+*.zip
+.DS_Store

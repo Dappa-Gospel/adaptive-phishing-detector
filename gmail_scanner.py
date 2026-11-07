@@ -40,16 +40,19 @@ trade-off is worth mentioning explicitly in your report.
 """
 
 import base64
-import os
+import html
+import platform
+import re
+import subprocess
 import time
-from datetime import datetime
 
 from classifier import classify
 from gmail_auth import get_gmail_service
+import storage
 
-LOG_PATH = "logs/scan_log.csv"
 LABEL_NAME = "⚠️ Possible Phishing"
 POLL_SECONDS = 30
+MAX_SEEN_IDS = 1000
 
 
 def get_or_create_label(service, label_name):
@@ -65,24 +68,45 @@ def get_or_create_label(service, label_name):
     return new_label["id"]
 
 
+def _decode_part(part):
+    data = part.get("body", {}).get("data", "")
+    if not data:
+        return ""
+    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+
+
+def _strip_html(markup):
+    """Turn an HTML email body into readable text without executing
+    or keeping any markup."""
+    markup = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", markup, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", markup)
+    return html.unescape(text)
+
+
 def extract_text(payload):
-    """Pulls the plain-text body out of a Gmail message payload,
-    which can be nested in different ways depending on the email."""
-    if "parts" in payload:
-        for part in payload["parts"]:
-            if part.get("mimeType") == "text/plain":
-                data = part["body"].get("data", "")
-                if data:
-                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-            elif "parts" in part:
-                text = extract_text(part)
-                if text:
-                    return text
-    else:
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-    return ""
+    """Pulls the readable body out of a Gmail message payload.
+
+    Prefers text/plain, then falls back to text/html. The old version
+    only looked at text/plain, so HTML-only emails (common for real
+    phishing) were scored on the subject alone.
+    """
+    plain_parts, html_parts = [], []
+
+    def walk(part):
+        mime = part.get("mimeType", "")
+        if mime == "text/plain":
+            plain_parts.append(_decode_part(part))
+        elif mime == "text/html":
+            html_parts.append(_strip_html(_decode_part(part)))
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload)
+
+    text = " ".join(t for t in plain_parts if t).strip()
+    if not text:
+        text = " ".join(t for t in html_parts if t).strip()
+    return re.sub(r"\s+", " ", text)
 
 
 def get_subject(headers):
@@ -92,26 +116,59 @@ def get_subject(headers):
     return "(no subject)"
 
 
+def _applescript_escape(value):
+    """Escape a value for safe use inside an AppleScript string.
+
+    The previous implementation interpolated the email subject
+    straight into a shell command, which allowed an attacker to run
+    arbitrary commands by sending a crafted subject. Values are now
+    passed as a single argv element, and this escaping is an extra
+    layer for AppleScript itself.
+    """
+    return (str(value)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", " ")
+            .replace("\r", " "))
+
+
 def notify_desktop(title, message):
     """Best-effort desktop notification. Works out of the box on Mac;
     silently does nothing on platforms without a notifier available,
     since the Gmail label + log entry are the reliable source of
-    truth regardless."""
+    truth regardless.
+
+    Uses list-form subprocess calls (never a shell) so an email
+    subject can never be interpreted as a command.
+    """
     try:
-        import platform
-        if platform.system() == "Darwin":
-            os.system(f"""osascript -e 'display notification "{message}" with title "{title}"' """)
-        elif platform.system() == "Linux":
-            os.system(f'notify-send "{title}" "{message}"')
+        system = platform.system()
+        if system == "Darwin":
+            script = (
+                f'display notification "{_applescript_escape(message)}" '
+                f'with title "{_applescript_escape(title)}"'
+            )
+            subprocess.run(["osascript", "-e", script],
+                           check=False, capture_output=True, timeout=5)
+        elif system == "Linux":
+            subprocess.run(["notify-send", str(title), str(message)],
+                           check=False, capture_output=True, timeout=5)
     except Exception:
+        # Notifications are a nice-to-have; the label and log are the
+        # reliable record.
         pass
 
 
 def log_scan(text, verdict, confidence):
-    import csv
-    with open(LOG_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now(), text[:80], verdict, confidence])
+    storage.append_scan_log(text, verdict, confidence)
+
+
+def _remember(seen_ids, msg_id):
+    """Add a message id and keep the set bounded for long-running
+    monitors."""
+    seen_ids.add(msg_id)
+    while len(seen_ids) > MAX_SEEN_IDS:
+        seen_ids.pop()
 
 
 def scan_inbox(service, label_id, seen_ids):
@@ -128,7 +185,7 @@ def scan_inbox(service, label_id, seen_ids):
         msg_id = msg_ref["id"]
         if msg_id in seen_ids:
             continue
-        seen_ids.add(msg_id)
+        _remember(seen_ids, msg_id)
 
         msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
         headers = msg["payload"].get("headers", [])
@@ -157,16 +214,19 @@ def scan_inbox(service, label_id, seen_ids):
     return results_out
 
 
-def scan_recent_inbox_once(service=None, max_results=10):
-    """One-shot scan used by the Streamlit 'Scan inbox now' button:
-    checks the most recent inbox messages regardless of whether
-    they've been seen before, applies labels/logs as normal, and
-    returns the results for display in the UI.
+def scan_recent_inbox_once(service=None, max_results=10, seen_ids=None):
+    """One-shot scan used by the Streamlit 'Scan inbox now' button.
 
     Accepts an already-authenticated `service` object so this same
     function works with either the local desktop auth flow or the
     public web auth flow - the caller decides which one built the
-    service, this function doesn't need to know or care."""
+    service, this function doesn't need to know or care.
+
+    `seen_ids` is optional. When the caller passes the session's set
+    of already-checked message ids, repeat clicks no longer re-scan
+    and re-log the same emails (which used to inflate the Statistics
+    page). Pass None to force a full re-scan.
+    """
     if service is None:
         service = get_gmail_service()
     label_id = get_or_create_label(service, LABEL_NAME)
@@ -178,6 +238,11 @@ def scan_recent_inbox_once(service=None, max_results=10):
     results_out = []
     for msg_ref in messages:
         msg_id = msg_ref["id"]
+        if seen_ids is not None:
+            if msg_id in seen_ids:
+                continue
+            _remember(seen_ids, msg_id)
+
         msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
         headers = msg["payload"].get("headers", [])
         subject = get_subject(headers)
@@ -211,7 +276,7 @@ def main():
     # alert on genuinely NEW mail from this point forward.
     initial = service.users().messages().list(userId="me", labelIds=["INBOX"], maxResults=15).execute()
     for m in initial.get("messages", []):
-        seen_ids.add(m["id"])
+        _remember(seen_ids, m["id"])
 
     while True:
         try:

@@ -26,6 +26,10 @@ What changed here:
 
 import pandas as pd
 import random
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data" / "dataset.csv"
 
 random.seed(42)
 
@@ -265,6 +269,6 @@ if __name__ == "__main__":
     df = df.drop_duplicates(subset="text").reset_index(drop=True)
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-    df.to_csv("data/dataset.csv", index=False)
+    df.to_csv(DATA_PATH, index=False)
     print(f"Dataset created: {len(df)} samples "
           f"({(df['label']==1).sum()} phishing, {(df['label']==0).sum()} legitimate)")

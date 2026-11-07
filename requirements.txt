@@ -1,8 +1,10 @@
-streamlit>=1.32
-pandas
-numpy
-scikit-learn
-joblib
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
+# Adaptive Phishing Detection System — runtime dependencies
+# Versions pinned to the environment the model was trained and tested in.
+streamlit==1.62.0
+pandas>=2.2,<4
+numpy>=1.26,<3
+scikit-learn==1.9.0
+joblib>=1.3,<2
+google-api-python-client>=2.100,<3
+google-auth-httplib2>=0.2,<1
+google-auth-oauthlib>=1.0,<2

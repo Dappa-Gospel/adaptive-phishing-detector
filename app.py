@@ -3,35 +3,33 @@ app.py
 ------
 Streamlit interface for the phishing detector.
 
-Simplified from the original version:
-- Classification is now strictly binary: PHISHING or SAFE. The old
-  confidence-threshold "SUSPICIOUS" middle tier has been removed to
-  keep the system easier to explain and defend.
-- Uses the Naive Bayes model (models/phishing_model.pkl) instead of
-  Random Forest.
-- The rule-based "reasons" checklist (Feature Extractor) is kept as
-  a separate explainability layer shown alongside the verdict - it
-  does not influence the model's decision, it just helps the user
-  understand WHY a message looks suspicious.
+Classification is strictly binary: PHISHING or SAFE. The old
+confidence-threshold "SUSPICIOUS" middle tier has been removed to
+keep the system easier to explain and defend.
+
+Uses the Naive Bayes model (models/phishing_model.pkl) instead of
+Random Forest. The rule-based "reasons" checklist (Feature Extractor)
+is kept as a separate explainability layer shown alongside the verdict.
 """
 
-import csv
+import html
 import json
-import os
-from datetime import datetime
+import subprocess
+import sys
+from pathlib import Path
 
 import joblib
 import pandas as pd
 import streamlit as st
 
+import classifier
+import storage
 from classifier import classify
 
-MODEL_PATH = "models/phishing_model.pkl"
-VECTORIZER_PATH = "models/vectorizer.pkl"
-METRICS_PATH = "models/metrics.json"
-LOG_PATH = "logs/scan_log.csv"
-FEEDBACK_PATH = "data/feedback.csv"
-DATA_PATH = "data/dataset.csv"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "phishing_model.pkl"
+VECTORIZER_PATH = BASE_DIR / "models" / "vectorizer.pkl"
+METRICS_PATH = BASE_DIR / "models" / "metrics.json"
 
 st.set_page_config(
     page_title="Adaptive AI Phishing Detection System",
@@ -43,28 +41,36 @@ st.set_page_config(
 
 @st.cache_resource
 def load_model_status():
-    """Just used to confirm the model files are present before the
-    Chat page tries to classify anything; classification itself is
-    handled by classifier.py."""
+    """Confirm the model files are present before the UI tries to
+    classify anything; classification itself is handled by
+    classifier.py."""
+    if not MODEL_PATH.exists() or not VECTORIZER_PATH.exists():
+        return False
     joblib.load(MODEL_PATH)
     joblib.load(VECTORIZER_PATH)
     return True
 
 
 def load_metrics():
-    with open(METRICS_PATH) as f:
-        return json.load(f)
+    try:
+        with METRICS_PATH.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
 
 
-load_model_status()
+if not load_model_status():
+    st.error("The model files are missing. Run `python3 train_model.py`, then restart the app.")
+    st.stop()
+
 metrics = load_metrics()
+if metrics is None:
+    st.error("Model metrics are missing. Run `python3 train_model.py`, then restart the app.")
+    st.stop()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "active_page" not in st.session_state:
-    st.session_state.active_page = "Chat"
-if "feedback_count" not in st.session_state:
-    st.session_state.feedback_count = 0
+for key, default in (("messages", []), ("active_page", "Chat"), ("gmail_seen_ids", set())):
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 st.markdown(
     """
@@ -80,35 +86,35 @@ st.markdown(
 
 
 # ---------------------------------------------------------------------
-# Core classification logic now lives in classifier.py (shared with
-# gmail_scanner.py) - imported at the top of this file.
+# Gmail OAuth callback
+#
+# Google redirects the browser back to the app root with ?code=... .
+# This has to be handled on every page, not just Settings, otherwise a
+# visitor who lands on Chat leaves the one-time code unused in the URL.
 # ---------------------------------------------------------------------
+def handle_oauth_redirect():
+    try:
+        import gmail_auth_web
+    except Exception:
+        return
+    try:
+        if not gmail_auth_web.is_cloud_configured():
+            return
+        if gmail_auth_web.handle_redirect_callback():
+            st.rerun()
+    except Exception as exc:
+        st.error(f"Google login could not be completed ({exc}). Please click Connect Gmail Account again.")
 
 
-def log_scan(text, verdict, confidence):
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    with open(LOG_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now(), text[:80], verdict, confidence])
-
-
-def save_feedback(text, correct_label):
-    with open(FEEDBACK_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([text, correct_label])
-    st.session_state.feedback_count += 1
+handle_oauth_redirect()
 
 
 def count_scans():
-    try:
-        log_df = pd.read_csv(LOG_PATH, header=None,
-                              names=["Timestamp", "Message", "Verdict", "Confidence"])
-        total = len(log_df)
-        phishing = (log_df["Verdict"] == "PHISHING").sum()
-        safe = (log_df["Verdict"] == "SAFE").sum()
-        return total, phishing, safe
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        return 0, 0, 0
+    rows = storage.read_scan_log()
+    total = len(rows)
+    phishing = sum(1 for r in rows if r["Verdict"] == "PHISHING")
+    safe = sum(1 for r in rows if r["Verdict"] == "SAFE")
+    return total, phishing, safe
 
 
 # ---------------------------------------------------------------------
@@ -121,7 +127,7 @@ with st.sidebar:
     pages = [("💬", "Chat"), ("📜", "History"), ("📊", "Statistics"),
              ("⚙️", "Settings"), ("ℹ️", "About")]
     for icon, name in pages:
-        if st.button(f"{icon} {name}", key=f"nav_{name}", use_container_width=True):
+        if st.button(f"{icon} {name}", key=f"nav_{name}", width="stretch"):
             st.session_state.active_page = name
             st.rerun()
     st.divider()
@@ -139,7 +145,11 @@ if page == "Chat":
 
     for msg in st.session_state.messages:
         if msg["role"] == "user":
-            st.markdown(f'<div class="user-msg">{msg["content"]}</div>', unsafe_allow_html=True)
+            # Escape before injecting into HTML: pasted text is untrusted.
+            st.markdown(
+                f'<div class="user-msg">{html.escape(str(msg["content"]))}</div>',
+                unsafe_allow_html=True,
+            )
         elif msg["role"] == "result":
             css_class = "phishing" if msg["verdict"] == "PHISHING" else "safe"
             icon = "🚨" if msg["verdict"] == "PHISHING" else "✅"
@@ -155,10 +165,10 @@ if page == "Chat":
     col_input, col_send = st.columns([5, 1])
     with col_input:
         user_text = st.text_area("Message", label_visibility="collapsed",
-                                  placeholder="Type or paste a message, email, or URL...",
-                                  height=80)
+                                 placeholder="Type or paste a message, email, or URL...",
+                                 height=80)
     with col_send:
-        send_clicked = st.button("Send ➤", use_container_width=True)
+        send_clicked = st.button("Send ➤", width="stretch")
 
     if send_clicked and user_text.strip():
         text = user_text.strip()
@@ -169,65 +179,120 @@ if page == "Chat":
             "role": "result", "verdict": verdict,
             "confidence": confidence, "reasons": reasons,
         })
-        log_scan(text, verdict, confidence)
+        storage.append_scan_log(text, verdict, confidence)
         st.session_state.last_scanned_text = text
         st.session_state.last_verdict = verdict
+        st.session_state.feedback_given_for = None
         st.rerun()
 
     if st.session_state.messages and st.session_state.messages[-1]["role"] == "result":
         st.divider()
         st.caption("Was this correct?")
-        c1, c2 = st.columns(2)
-        if c1.button("✅ Yes, correct"):
-            st.success("Thanks for confirming!")
-        if c2.button("❌ No, incorrect"):
-            correct_label = 0 if st.session_state.last_verdict == "PHISHING" else 1
-            save_feedback(st.session_state.last_scanned_text, correct_label)
-            st.info("Correction saved. Retrain the model from Settings to apply it.")
+        feedback_key = (
+            f"{st.session_state.get('last_scanned_text', '')}"
+            f"|{st.session_state.get('last_verdict', '')}"
+        )
+        if st.session_state.get("feedback_given_for") == feedback_key:
+            st.success("Thanks — your feedback has been saved.")
+        else:
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Yes, correct"):
+                label = 1 if st.session_state.last_verdict == "PHISHING" else 0
+                storage.append_feedback(st.session_state.last_scanned_text, label)
+                st.session_state.feedback_given_for = feedback_key
+                st.rerun()
+            if c2.button("❌ No, incorrect"):
+                label = 0 if st.session_state.last_verdict == "PHISHING" else 1
+                storage.append_feedback(st.session_state.last_scanned_text, label)
+                st.session_state.feedback_given_for = feedback_key
+                st.info("Correction saved. Retrain the model from Settings to apply it.")
+                st.rerun()
 
 # ---------------------------------------------------------------------
 # History page
 # ---------------------------------------------------------------------
 elif page == "History":
     st.title("📜 Scan History")
-    try:
-        log_df = pd.read_csv(LOG_PATH, header=None,
-                              names=["Timestamp", "Message", "Verdict", "Confidence"])
-        log_df = log_df.iloc[::-1].reset_index(drop=True)
-        st.dataframe(log_df, use_container_width=True)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
+    rows = storage.read_scan_log()
+    if not rows:
         st.info("No scans yet. Go to Chat to scan a message.")
+    else:
+        log_df = pd.DataFrame(rows)
+        log_df = log_df.iloc[::-1].reset_index(drop=True)
+        st.dataframe(log_df, width="stretch")
 
 # ---------------------------------------------------------------------
 # Statistics page
 # ---------------------------------------------------------------------
 elif page == "Statistics":
-    st.title("📊 Statistics")
+    st.title("📊 Model Accuracy & Statistics")
+
     total, phishing, safe = count_scans()
+    feedback_given = len(storage.read_feedback())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Scans", total)
     c2.metric("Phishing Detected", phishing)
     c3.metric("Safe Messages", safe)
-    c4.metric("Feedback Given", st.session_state.feedback_count)
+    c4.metric("Feedback Given", feedback_given)
 
     st.divider()
-    st.subheader("Model Performance")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accuracy", f"{metrics['accuracy']*100:.1f}%")
-    c2.metric("Precision", f"{metrics['precision']*100:.1f}%")
-    c3.metric("Recall", f"{metrics['recall']*100:.1f}%")
-    c4.metric("F1-Score", f"{metrics['f1_score']*100:.1f}%")
+    st.subheader("🎯 Model Accuracy")
 
-    st.subheader("Confusion Matrix")
-    cm = metrics["confusion_matrix"]
-    cm_df = pd.DataFrame(
-        [[cm["true_negative"], cm["false_positive"]],
-         [cm["false_negative"], cm["true_positive"]]],
-        index=["Actually Safe", "Actually Phishing"],
-        columns=["Predicted Safe", "Predicted Phishing"],
-    )
-    st.dataframe(cm_df, use_container_width=True)
+    acc = float(metrics.get("accuracy", 0.0))
+    prec = float(metrics.get("precision", 0.0))
+    rec = float(metrics.get("recall", 0.0))
+    f1 = float(metrics.get("f1_score", 0.0))
+    test_size = int(metrics.get("test_size", 0))
+
+    col_left, col_right = st.columns([1, 2])
+    with col_left:
+        st.metric("Overall accuracy", f"{acc * 100:.2f}%")
+        st.progress(min(max(acc, 0.0), 1.0))
+        correct = round(acc * test_size) if test_size else 0
+        st.caption(
+            f"Correctly classified **{correct} of {test_size}** held-out test messages."
+        )
+    with col_right:
+        scores = pd.DataFrame(
+            {"Score (%)": [acc * 100, prec * 100, rec * 100, f1 * 100]},
+            index=["Accuracy", "Precision", "Recall", "F1-score"],
+        )
+        st.bar_chart(scores, height=280)
+        st.caption("All four measures are shown as percentages on the same 0–100 scale.")
+
+    st.subheader("Accuracy by class")
+    cm = metrics.get("confusion_matrix", {})
+    tn = int(cm.get("true_negative", 0))
+    fp = int(cm.get("false_positive", 0))
+    fn = int(cm.get("false_negative", 0))
+    tp = int(cm.get("true_positive", 0))
+
+    class_df = pd.DataFrame([
+        {"Class": "Safe", "Correct": tn, "Total": tn + fp},
+        {"Class": "Phishing", "Correct": tp, "Total": tp + fn},
+    ])
+    class_df["Accuracy (%)"] = (
+        class_df["Correct"] / class_df["Total"].replace(0, pd.NA) * 100
+    ).round(1)
+
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        st.dataframe(class_df, width="stretch", hide_index=True)
+    with col_right:
+        st.bar_chart(class_df.set_index("Class")["Accuracy (%)"], height=240)
+
+    with st.expander("Confusion matrix (technical detail)"):
+        st.caption(
+            "Rows are the true label and columns are the model's prediction. "
+            "The diagonal cells are correct decisions; off-diagonal cells are errors."
+        )
+        cm_df = pd.DataFrame(
+            [[tn, fp], [fn, tp]],
+            index=["Actually Safe", "Actually Phishing"],
+            columns=["Predicted Safe", "Predicted Phishing"],
+        )
+        st.dataframe(cm_df, width="stretch")
 
 # ---------------------------------------------------------------------
 # Settings page
@@ -243,9 +308,6 @@ elif page == "Settings":
     gmail = gmail_auth_web if CLOUD_MODE else gmail_auth
 
     if CLOUD_MODE:
-        # Complete the login exchange if Google just redirected back
-        # with a ?code=... parameter in the URL.
-        gmail_auth_web.handle_redirect_callback()
         st.caption("🌐 Running in public deployment mode — each visitor connects their own account for their session only.")
 
     if gmail.is_connected():
@@ -258,23 +320,32 @@ elif page == "Settings":
                        "Try reconnecting if this persists.")
             service = None
 
+        rescan = st.checkbox("Re-scan emails already checked in this session", value=False)
+
         c1, c2 = st.columns(2)
         if c1.button("🔍 Scan inbox now"):
             with st.spinner("Scanning recent inbox messages..."):
                 try:
                     import gmail_scanner
                     scan_service = service or gmail.get_gmail_service()
-                    results = gmail_scanner.scan_recent_inbox_once(service=scan_service, max_results=10)
+                    seen = None if rescan else st.session_state.gmail_seen_ids
+                    results = gmail_scanner.scan_recent_inbox_once(
+                        service=scan_service, max_results=10, seen_ids=seen
+                    )
                     flagged = [r for r in results if r["verdict"] == "PHISHING"]
-                    st.info(f"Scanned {len(results)} recent emails — {len(flagged)} flagged as phishing.")
-                    for r in results:
-                        icon = "🚨" if r["verdict"] == "PHISHING" else "✅"
-                        st.write(f'{icon} **{r["verdict"]}** ({r["confidence"]}%) — {r["subject"]}')
+                    if not results:
+                        st.info("No new emails to scan.")
+                    else:
+                        st.info(f"Scanned {len(results)} recent emails — {len(flagged)} flagged as phishing.")
+                        for r in results:
+                            icon = "🚨" if r["verdict"] == "PHISHING" else "✅"
+                            st.write(f'{icon} **{r["verdict"]}** ({r["confidence"]}%) — {r["subject"]}')
                 except Exception as e:
                     st.error(f"Scan failed: {e}")
 
         if c2.button("🔌 Disconnect Gmail"):
             gmail.disconnect()
+            st.session_state.gmail_seen_ids = set()
             st.success("Disconnected.")
             st.rerun()
 
@@ -335,22 +406,33 @@ elif page == "Settings":
 
     st.divider()
     st.subheader("Adaptive Retraining")
-    st.caption("Merge saved user feedback with the training data and rebuild the model.")
+    st.caption(
+        "Merge saved user feedback with the training data and rebuild the model. "
+        f"{len(storage.read_feedback())} feedback example(s) will be used."
+    )
 
     if st.button("🔄 Retrain Model Now"):
         with st.spinner("Retraining..."):
-            import subprocess
-            result = subprocess.run(["python3", "train_model.py"],
-                                     capture_output=True, text=True)
-            if result.returncode == 0:
-                st.success("Model retrained successfully! Restart the app to load the new model.")
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(BASE_DIR / "train_model.py")],
+                    capture_output=True, text=True, cwd=str(BASE_DIR), timeout=300,
+                )
+            except subprocess.TimeoutExpired:
+                st.error("Training timed out after 5 minutes.")
             else:
-                st.error(f"Error: {result.stderr}")
+                if result.returncode == 0:
+                    classifier.reset_model()
+                    st.cache_resource.clear()
+                    st.success("Model retrained successfully. The new model is now active.")
+                    st.rerun()
+                else:
+                    st.error(f"Error: {result.stderr or result.stdout}")
 
     st.divider()
     st.subheader("Data Management")
     if st.button("🗑️ Clear Scan History"):
-        open(LOG_PATH, "w").close()
+        storage.clear_scan_log()
         st.success("Scan history cleared.")
 
 # ---------------------------------------------------------------------

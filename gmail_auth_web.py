@@ -33,6 +33,15 @@ discarded when their session ends. This is a deliberate privacy
 choice appropriate for a public demo: the server never accumulates a
 growing list of strangers' access tokens.
 
+CSRF protection (the `state` parameter):
+A random nonce and timestamp are signed with the OAuth client secret
+using HMAC-SHA256. Google echoes the value back on redirect, and this
+module verifies the signature and age before accepting the one-time
+code. Signing it (rather than keeping it only in session state) means
+the check still works if Streamlit creates a fresh session for the
+redirect - while still making it impossible for an attacker to forge
+a valid state.
+
 Credentials handling:
 The OAuth client ID/secret for this web flow are read from Streamlit
 secrets (st.secrets), configured in Streamlit Cloud's dashboard - NOT
@@ -40,7 +49,14 @@ committed to the repository, exactly like credentials.json is kept
 out of git in the desktop-flow setup.
 """
 
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
 import json
+import os
+import time
 
 import streamlit as st
 from google.oauth2.credentials import Credentials
@@ -49,13 +65,17 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
+# A login link is only valid for ten minutes.
+STATE_TTL_SECONDS = 600
+
 
 def is_cloud_configured():
-    """True once this deployment has Gmail web-OAuth secrets set up
-    in Streamlit Cloud's Secrets manager. If false, app.py falls back
-    to the local desktop flow instead."""
+    """True once this deployment has a complete Gmail web-OAuth secrets
+    block in Streamlit Cloud's Secrets manager. If false, app.py falls
+    back to the local desktop flow instead."""
     try:
-        return "gmail" in st.secrets and "client_id" in st.secrets["gmail"]
+        gmail = st.secrets["gmail"]
+        return all(key in gmail for key in ("client_id", "client_secret", "redirect_uri"))
     except Exception:
         return False
 
@@ -72,38 +92,56 @@ def _client_config():
     }
 
 
-def get_authorization_url():
-    """Builds the link the visitor clicks to start Google login. A
-    random `state` value is stored in this visitor's session and
-    later checked on return, as a CSRF protection - it proves the
-    person completing login is the same person who started it.
+def _state_secret() -> bytes:
+    """Key used to sign the OAuth state. The client secret is already a
+    server-only value, so it never needs to be sent to the browser."""
+    return str(st.secrets["gmail"]["client_secret"]).encode("utf-8")
 
-    PKCE (autogenerate_code_verifier) is deliberately disabled here.
-    PKCE exists to protect "public" clients that can't safely hold a
-    secret (like mobile apps). This app authenticates with Google
-    using a client_secret instead (a "confidential" client), which
-    already proves its identity without needing PKCE. Using PKCE here
-    would require the code_verifier generated for the login link to
-    still be available later when Google redirects back - but that
-    redirect is a real browser navigation, not just an in-app rerun,
-    and isn't guaranteed to land back in the exact same Streamlit
-    session. Skipping PKCE entirely avoids depending on that."""
+
+def _sign(payload: str) -> str:
+    return hmac.new(_state_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_state() -> str:
+    """Create a signed, timestamped, single-use-ish state value."""
+    nonce = base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
+    payload = f"{nonce}.{int(time.time())}"
+    return f"{payload}.{_sign(payload)}"
+
+
+def verify_state(state: str | None) -> bool:
+    """Accept only a state this app signed, and only while fresh."""
+    if not state:
+        return False
+    try:
+        nonce, timestamp, signature = state.rsplit(".", 2)
+        payload = f"{nonce}.{timestamp}"
+        if not hmac.compare_digest(signature, _sign(payload)):
+            return False
+        return (time.time() - int(timestamp)) <= STATE_TTL_SECONDS
+    except Exception:
+        return False
+
+
+def get_authorization_url():
+    """Builds the link the visitor clicks to start Google login."""
     flow = Flow.from_client_config(
         _client_config(), scopes=SCOPES,
         redirect_uri=st.secrets["gmail"]["redirect_uri"],
         autogenerate_code_verifier=False,
     )
-    auth_url, state = flow.authorization_url(
+    auth_url, _state = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
+        include_granted_scopes=True,
         prompt="consent",
+        state=make_state(),
     )
-    st.session_state["_gmail_oauth_state"] = state
     return auth_url
 
 
 def handle_redirect_callback():
-    """Call this near the top of the Settings page on every load.
+    """Call this near the top of the app on every load.
+
     If Google just redirected the visitor back with a `code`
     parameter, this exchanges it for credentials and stores them in
     THIS visitor's session only. Safe to call when there's no code
@@ -112,7 +150,8 @@ def handle_redirect_callback():
     Guards against Streamlit's automatic reruns submitting the same
     one-time authorization code to Google more than once - Google
     accepts a code exactly once and rejects any repeat with
-    invalid_grant, which otherwise surfaces as a crash on screen."""
+    invalid_grant, which otherwise surfaces as a crash on screen.
+    """
     params = st.query_params
     code = params.get("code")
     returned_state = params.get("state")
@@ -122,13 +161,14 @@ def handle_redirect_callback():
     if st.session_state.get("_gmail_last_code_seen") == code:
         # Already handled (successfully or not) on an earlier rerun
         # of this same script - don't resubmit it.
+        st.query_params.clear()
         return is_connected()
     st.session_state["_gmail_last_code_seen"] = code
 
-    expected_state = st.session_state.get("_gmail_oauth_state")
-    if expected_state and returned_state != expected_state:
-        st.error("Login could not be verified (state mismatch). Please try connecting again.")
+    # Fail closed: an absent, forged, or expired state is rejected.
+    if not verify_state(returned_state):
         st.query_params.clear()
+        st.error("Login could not be verified (state mismatch). Please try connecting again.")
         return False
 
     try:
@@ -155,7 +195,7 @@ def is_connected():
 
 def disconnect():
     st.session_state.pop("gmail_creds", None)
-    st.session_state.pop("_gmail_oauth_state", None)
+    st.session_state.pop("_gmail_last_code_seen", None)
 
 
 def get_gmail_service():
